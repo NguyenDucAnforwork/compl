@@ -71,7 +71,14 @@ class Abstract_Model(object):
         )
 
     def predict(self, test_idxs):
-        """Predict on test indices"""
+    # đảm bảo dtype int64 (khớp với lvector)
+        if test_idxs.dtype != np.int64:
+            test_idxs = test_idxs.astype(np.int64)
+
+        # nếu chưa compile thì compile ngay
+        if self.pred_func_compiled is None:
+            self.compile_prediction()
+
         return self.pred_func_compiled(*self.get_pred_args(test_idxs))
 
     def get_init_params(self):
@@ -102,77 +109,102 @@ class Abstract_Model(object):
         # Initialize model
         self.allocate_params()
         self.define_loss()
-        # self.compile_prediction()
+        self.compile_prediction()
         
         print(f"Model initialized with {self.nb_params} parameters")
         print(f"Dimensions: n={self.n}, m={self.m}, l={self.l}, k={self.k}")
         
-        # Simple training loop
-        learning_rate = min(hparams.learning_rate, 0.01)
+        # Hyperparameters
+        learning_rate = hparams.learning_rate
         lmbda = hparams.lmbda
-        max_iter = min(hparams.max_iter, 2500)  # Limit iterations for quick test
-        batch_size = min(hparams.batch_size, 1000)  # Limit batch size
-        
-        # Create simple training function
-        loss_total = self.loss + lmbda * self.regul_func
-        
-        # Get parameters
+        max_iter = hparams.max_iter
+        batch_size = hparams.batch_size
+        neg_ratio = getattr(hparams, 'neg_ratio', 1)
+
+        # Get trainable parameters
         params = []
         if hasattr(self, 'e'):
             params.extend([self.e, self.r])
         if hasattr(self, 'e1'):
             params.extend([self.e1, self.e2, self.r1, self.r2])
+
+        # --- Adagrad Optimizer Setup ---
+        # Create shared variables for Adagrad gradient accumulators
+        accumulators = [
+            pytensor.shared(np.zeros(p.get_value(borrow=True).shape, dtype=data_type))
+            for p in params
+        ]
         
+        # Define loss and gradients
+        loss_total = self.loss + lmbda * self.regul_func
         grads = pytensor.grad(loss_total, params)
-        # 👇 Clip để tránh nổ gradient
-        grads = [pt.clip(g, -5.0, 5.0) for g in grads]
-        updates = [(p, p - learning_rate * g) for p, g in zip(params, grads)]
         
+        # Adagrad update rule
+        updates = []
+        for p, g, a in zip(params, grads, accumulators):
+            # Clip gradient to prevent explosion
+            clipped_g = pt.clip(g, -5.0, 5.0)
+            # Update accumulator
+            new_a = a + clipped_g ** 2
+            updates.append((a, new_a))
+            # Update parameter
+            updates.append((p, p - (learning_rate / (pt.sqrt(new_a) + 1e-8)) * clipped_g))
+        
+        # Compile the training function
         train_fn = pytensor.function(
             [self.rows, self.cols, self.tubes, self.ys],
             [loss_total, self.loss],
             updates=updates
         )
 
-        # print params initial values
-        print("***INITIAL VALUES: ***", self.e.get_value()[0])
+        print(f"***INITIAL VALUES (sample): *** {self.e.get_value()[0, :5]}")
         
         # Simple training with positive samples only
-        n_samples = min(len(train_triples.indexes), 1000)  # Limit samples
+        n_train_samples = len(train_triples.indexes)  # Limit samples
         
         for epoch in range(max_iter):
-            pos_idx = np.random.choice(len(train_triples.indexes),
-                                    min(batch_size, n_samples), replace=False)
-            pr = train_triples.indexes[pos_idx, 0].astype('int64')  # s
-            pc = train_triples.indexes[pos_idx, 1].astype('int64')  # r
-            ptb = train_triples.indexes[pos_idx, 2].astype('int64') # o
+            # --- Data Sampling (FIXED) ---
+            # Sample a batch from the ENTIRE training set
+            pos_indices = np.random.choice(n_train_samples, batch_size, replace=False)
+            pos_batch = train_triples.indexes[pos_indices]
 
-            # --- Negative sampling: corrupt object
-            n_entities = max(self.n, self.l)  # DistMult/ComplEx dùng e size = max(n,l)
-            neg_ratio = max(1, getattr(hparams, "neg_ratio", 1))
-            nr = np.repeat(pc, neg_ratio)
-            ns = np.repeat(pr, neg_ratio)
-            # sample random objects
-            no = np.random.randint(0, n_entities, size=len(ns)).astype('int64')  # 👈 dùng n_entities
+            # --- Negative Sampling ---
+            # Corrupt either subject or object
+            corrupted_batch = pos_batch.copy()
+            n_entities = self.e.get_value(borrow=True).shape[0]
+            
+            # For each positive sample, create 'neg_ratio' negative samples
+            num_negs = batch_size * neg_ratio
+            random_entities = np.random.randint(0, n_entities, size=num_negs)
+            
+            # Repeat positive triples to match number of negative samples
+            repeated_pos = np.repeat(pos_batch, neg_ratio, axis=0)
+            
+            # Decide whether to corrupt subject (0) or object (1)
+            sub_or_obj_corr = np.random.randint(2, size=num_negs)
+            
+            mask_sub = (sub_or_obj_corr == 0)
+            repeated_pos[mask_sub, 0] = random_entities[mask_sub]
+            
+            mask_obj = (sub_or_obj_corr == 1)
+            repeated_pos[mask_obj, 2] = random_entities[mask_obj]
+            
+            neg_batch = repeated_pos
 
-            # (tùy chọn) tránh false negative đơn giản
-            # for t in range(len(ns)):
-            #     while (ns[t], nr[t]) in scorer.known_obj_triples and \
-            #           no[t] in scorer.known_obj_triples[(ns[t], nr[t])]:
-            #         no[t] = np.random.randint(0, self.n, dtype='int64')
-
-            # --- Gộp positives + negatives
-            rows = np.concatenate([pr, ns])
-            cols = np.concatenate([pc, nr])
-            tubes = np.concatenate([ptb, no])
-            ys = np.concatenate([np.ones(len(pr), dtype='float32'),
-                                np.zeros(len(ns), dtype='float32')])
-
-            batch_ys = ys.astype('float32')  # đảm bảo float32
-            total_loss, main_loss = train_fn(rows, cols, tubes, ys)
+            # --- Prepare batch for training ---
+            full_batch_rows = np.concatenate([pos_batch[:, 0], neg_batch[:, 0]]).astype('int64')
+            full_batch_cols = np.concatenate([pos_batch[:, 1], neg_batch[:, 1]]).astype('int64')
+            full_batch_tubes = np.concatenate([pos_batch[:, 2], neg_batch[:, 2]]).astype('int64')
+            
+            ys = np.concatenate([
+                np.ones(batch_size, dtype=data_type),
+                np.zeros(num_negs, dtype=data_type)
+            ])
+            
+            total_loss, main_loss = train_fn(full_batch_rows, full_batch_cols, full_batch_tubes, ys)
 
             if epoch % 100 == 0:
-                print(f"Epoch {epoch}: Loss = {total_loss:.4f}")
+                print(f"Epoch {epoch}: Loss = {total_loss:.4f} (Main Loss: {main_loss:.4f})")
 
 
 
